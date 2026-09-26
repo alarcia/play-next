@@ -1,0 +1,80 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-push:
+    # Runner ARM64 nativo (gratis en repos públicos): compila para la Pi sin emular con QEMU
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Descargar repo
+        uses: actions/checkout@v4
+
+      - name: Iniciar sesión en GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configurar Docker Buildx (para compilar en ARM64 si tu Pi lo requiere)
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compilar y subir imagen Docker
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # La Raspberry suele ser ARM64 (o ARMv7 en modelos antiguos)
+          platforms: linux/arm64
+          tags: ghcr.io/${{ github.repository }}:latest
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Instalar cloudflared
+        run: |
+          curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared bullseye main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
+          sudo apt-get update && sudo apt-get install -y cloudflared
+
+      - name: Configurar clave y túnel SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+          cat << 'EOF' > ~/.ssh/config
+          Host pi-deploy
+            HostName ${{ secrets.SSH_HOST }}
+            User ${{ secrets.SSH_USER }}
+            IdentityFile ~/.ssh/id_ed25519
+            StrictHostKeyChecking no
+            ProxyCommand cloudflared access ssh --hostname %h --id ${{ secrets.CF_ACCESS_CLIENT_ID }} --secret ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Desplegar en la Raspberry
+        run: |
+          ssh pi-deploy << 'EOF'
+            set -e
+            cd ~/play-next
+            
+            # Descarga la nueva imagen que se acaba de subir a GHCR
+            docker compose pull
+            
+            # Levanta el contenedor con la nueva versión (sin downtime perceptible)
+            docker compose up -d --remove-orphans
+            
+            # Limpia imágenes viejas para no llenar la tarjeta SD de la Pi
+            docker image prune -f
+          EOF
